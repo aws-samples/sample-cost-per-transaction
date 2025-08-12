@@ -24,7 +24,7 @@ The **architecture** consists of the following components with comprehensive sec
 5. **Amplify App** (Authentication)
    - Hotel Booking Application frontend with proper authorization
 
-## 📁 Repository Structure (Security Hardened)
+## 📁 Repository Structure
 
 ```
 /ab3_full_stack/
