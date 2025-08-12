@@ -1,0 +1,59 @@
+# Secure GraphQL schema with proper authentication and authorization
+# Removed public access for production security
+
+type Hotel @model @aws_cognito_user_pools @auth(rules: [
+  {allow: private, operations: [read]},
+  {allow: groups, groups: ["Admin"], operations: [create, update, delete]},
+  {allow: owner, ownerField: "createdBy", operations: [read]}
+]) {
+  id: ID!
+  name: String!
+  description: String!
+  address: String!
+  city: String!
+  imageUrl: String
+  createdBy: String
+  rooms: [Room] @hasMany(indexName: "byHotel", fields: ["id"])
+}
+
+type Room @model @aws_cognito_user_pools @auth(rules: [
+  {allow: private, operations: [read]},
+  {allow: groups, groups: ["Admin"], operations: [create, update, delete]},
+  {allow: owner, ownerField: "createdBy", operations: [read]}
+]) {
+  id: ID!
+  hotelID: ID! @index(name: "byHotel")
+  name: String!
+  description: String!
+  price: Float!
+  imageUrl: String
+  capacity: Int!
+  amenities: [String]
+  isAvailable: Boolean!
+  createdBy: String
+  bookings: [Booking] @hasMany
+}
+
+type Booking @model @aws_cognito_user_pools @auth(rules: [
+  {allow: owner, ownerField: "userID"},
+  {allow: groups, groups: ["Admin"], operations: [read, update, delete]}
+]) {
+  id: ID!
+  roomID: ID! @index(name: "byRoom")
+  userID: ID!
+  startDate: AWSDateTime!
+  endDate: AWSDateTime!
+  totalPrice: Float!
+  status: BookingStatus!
+  guestName: String!
+  guestEmail: String!
+  specialRequests: String
+  createdAt: AWSDateTime
+  updatedAt: AWSDateTime
+}
+
+enum BookingStatus {
+  PENDING
+  CONFIRMED
+  CANCELLED
+}

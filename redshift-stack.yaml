@@ -1,0 +1,204 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Secure Nested Stack for Redshift Cluster'
+
+Parameters:
+  RedshiftMasterUsername:
+    Type: String
+    Default: admin
+    NoEcho: true
+    Description: Username for Redshift cluster master user
+    
+  RedshiftMasterPassword:
+    Type: String
+    NoEcho: true
+    Description: Password for Redshift cluster master user
+    MinLength: 8
+    
+  VPCId:
+    Type: String
+    Description: VPC ID for Redshift cluster
+    
+  PrivateSubnet1Id:
+    Type: String
+    Description: Private subnet 1 ID
+    
+  PrivateSubnet2Id:
+    Type: String
+    Description: Private subnet 2 ID
+    
+  KMSKeyArn:
+    Type: String
+    Description: KMS Key ARN for encryption
+    
+  AccessLogsBucketName:
+    Type: String
+    Description: S3 bucket for access logs
+
+Resources:
+  # Redshift Subnet Group
+  RedshiftSubnetGroup:
+    Type: AWS::Redshift::SubnetGroup
+    Properties:
+      Description: Subnet group for Redshift cluster in private subnets
+      SubnetIds:
+        - !Ref PrivateSubnet1Id
+        - !Ref PrivateSubnet2Id
+      Tags:
+        - Key: Name
+          Value: AB3-Redshift-SubnetGroup
+
+  # Secure Security Groups
+  RedshiftSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for Redshift cluster with restricted access
+      VpcId: !Ref VPCId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5439
+          ToPort: 5439
+          SourceSecurityGroupId: !Ref GlueSecurityGroup
+          Description: Allow Redshift access from Glue ETL jobs only
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: HTTPS outbound for AWS API calls and services only
+      Tags:
+        - Key: Name
+          Value: AB3-Redshift-SG
+
+  GlueSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for Glue jobs with minimal access
+      VpcId: !Ref VPCId
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 5439
+          ToPort: 5439
+          DestinationSecurityGroupId: !Ref RedshiftSecurityGroup
+          Description: Access to Redshift cluster only
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: HTTPS outbound for AWS API calls only
+      Tags:
+        - Key: Name
+          Value: AB3-Glue-SG
+
+  # Redshift Parameter Group for Security
+  RedshiftParameterGroup:
+    Type: AWS::Redshift::ClusterParameterGroup
+    Properties:
+      Description: Secure parameter group for AB3 Redshift cluster
+      ParameterGroupFamily: redshift-1.0
+      Parameters:
+        - ParameterName: enable_user_activity_logging
+          ParameterValue: 'true'
+        - ParameterName: log_statement
+          ParameterValue: 'all'
+        - ParameterName: require_ssl
+          ParameterValue: 'true'
+        - ParameterName: enable_case_sensitive_identifier
+          ParameterValue: 'true'
+      Tags:
+        - Key: Name
+          Value: AB3-Redshift-ParamGroup
+
+  # Secure Redshift Cluster
+  RedshiftCluster:
+    Type: AWS::Redshift::Cluster
+    Properties:
+      ClusterIdentifier: tco-tbm-ab3
+      DBName: tco_tbm_db
+      MasterUsername: !Ref RedshiftMasterUsername
+      MasterUserPassword: !Ref RedshiftMasterPassword
+      NodeType: dc2.large
+      ClusterType: single-node
+      DBSubnetGroupName: !Ref RedshiftSubnetGroup
+      VpcSecurityGroupIds:
+        - !Ref RedshiftSecurityGroup
+      PubliclyAccessible: false
+      Port: 5439
+      Encrypted: true
+      KmsKeyId: !Ref KMSKeyArn
+      EnhancedVpcRouting: true
+      ClusterParameterGroupName: !Ref RedshiftParameterGroup
+      LoggingProperties:
+        BucketName: !Ref AccessLogsBucketName
+        S3KeyPrefix: redshift-logs/
+      MaintenanceTrackName: current
+      AutomatedSnapshotRetentionPeriod: 7
+      PreferredMaintenanceWindow: sun:03:00-sun:04:00
+      Tags:
+        - Key: Name
+          Value: tco-tbm-ab3
+        - Key: Environment
+          Value: Production
+        - Key: Application
+          Value: AB3-HotelBooking
+
+  # CloudWatch Log Group for Redshift
+  RedshiftLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/redshift/cluster/tco-tbm-ab3
+      RetentionInDays: 90
+      KmsKeyId: !Ref KMSKeyArn
+
+  # CloudWatch Alarms for Redshift
+  RedshiftCPUAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Redshift cluster high CPU utilization
+      MetricName: CPUUtilization
+      Namespace: AWS/Redshift
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: ClusterIdentifier
+          Value: !Ref RedshiftCluster
+      TreatMissingData: notBreaching
+
+  RedshiftConnectionsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Redshift cluster high connection count
+      MetricName: DatabaseConnections
+      Namespace: AWS/Redshift
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: ClusterIdentifier
+          Value: !Ref RedshiftCluster
+      TreatMissingData: notBreaching
+
+Outputs:
+  RedshiftClusterEndpoint:
+    Description: "Redshift Cluster Endpoint"
+    Value: !GetAtt RedshiftCluster.Endpoint.Address
+    
+  RedshiftClusterPort:
+    Description: "Redshift Cluster Port"
+    Value: !GetAtt RedshiftCluster.Endpoint.Port
+    
+  RedshiftClusterId:
+    Description: "Redshift Cluster Identifier"
+    Value: !Ref RedshiftCluster
+    
+  RedshiftSecurityGroupId:
+    Description: "Redshift Security Group ID"
+    Value: !Ref RedshiftSecurityGroup
+    
+  GlueSecurityGroupId:
+    Description: "Glue Security Group ID"
+    Value: !Ref GlueSecurityGroup

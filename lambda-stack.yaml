@@ -1,0 +1,510 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Secure Nested Stack for Lambda Functions and API Gateway'
+
+Parameters:
+  DeploymentBucketName:
+    Type: String
+    Description: Name of the S3 bucket for Lambda deployment packages
+  
+  XRayDataBucketName:
+    Type: String
+    Description: Name of the S3 bucket for X-Ray data
+    
+  VPCId:
+    Type: String
+    Description: VPC ID for Lambda functions
+    
+  PrivateSubnet1Id:
+    Type: String
+    Description: Private subnet 1 ID
+    
+  PrivateSubnet2Id:
+    Type: String
+    Description: Private subnet 2 ID
+    
+  KMSKeyArn:
+    Type: String
+    Description: KMS Key ARN for encryption
+
+Resources:
+  # Dead Letter Queue for Lambda functions
+  DeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: AB3-Lambda-DLQ
+      MessageRetentionPeriod: 1209600  # 14 days
+      KmsMasterKeyId: !Ref KMSKeyArn
+
+  # Lambda Security Group
+  LambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for Lambda functions with minimal access
+      VpcId: !Ref VPCId
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: HTTPS outbound for AWS API calls only
+      Tags:
+        - Key: Name
+          Value: AB3-Lambda-SG
+
+  # Cognito User Pool for API Authentication
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: AB3HotelBookingUserPool
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 12
+          RequireUppercase: true
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: true
+      MfaConfiguration: OPTIONAL
+      EnabledMfas:
+        - SOFTWARE_TOKEN_MFA
+      Schema:
+        - Name: email
+          AttributeDataType: String
+          Required: true
+          Mutable: true
+      AutoVerifiedAttributes:
+        - email
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref UserPool
+      ClientName: AB3HotelBookingClient
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+      TokenValidityUnits:
+        AccessToken: hours
+        IdToken: hours
+        RefreshToken: days
+      AccessTokenValidity: 1
+      IdTokenValidity: 1
+      RefreshTokenValidity: 30
+
+  # Lambda Functions with Security Hardening
+  XRayExtractionFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: ab3-xray-XRayExtractionFunction
+      Handler: lambda_function.lambda_handler
+      Runtime: python3.9
+      Code:
+        S3Bucket: !Ref DeploymentBucketName
+        S3Key: lambda/xray-extraction.zip
+      MemorySize: 512
+      Timeout: 300
+      Role: !GetAtt XRayExtractionRole.Arn
+      ReservedConcurrentExecutions: 10
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+        SubnetIds:
+          - !Ref PrivateSubnet1Id
+          - !Ref PrivateSubnet2Id
+      DeadLetterConfig:
+        TargetArn: !GetAtt DeadLetterQueue.Arn
+      Environment:
+        Variables:
+          S3_BUCKET: !Ref XRayDataBucketName
+      KmsKeyArn: !Ref KMSKeyArn
+
+  HotelTraceGeneratorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: lambda-generator-HotelTraceGeneratorFunction
+      Handler: lambda_function.lambda_handler
+      Runtime: python3.9
+      Code:
+        S3Bucket: !Ref DeploymentBucketName
+        S3Key: lambda/hotel-trace-generator.zip
+      MemorySize: 256
+      Timeout: 30
+      Role: !GetAtt HotelTraceGeneratorRole.Arn
+      ReservedConcurrentExecutions: 5
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+        SubnetIds:
+          - !Ref PrivateSubnet1Id
+          - !Ref PrivateSubnet2Id
+      DeadLetterConfig:
+        TargetArn: !GetAtt DeadLetterQueue.Arn
+      TracingConfig:
+        Mode: Active
+      KmsKeyArn: !Ref KMSKeyArn
+
+  # WAF for API Gateway
+  WebACL:
+    Type: AWS::WAFv2::WebACL
+    Properties:
+      Name: AB3HotelBookingWAF
+      Scope: REGIONAL
+      DefaultAction:
+        Allow: {}
+      Rules:
+        - Name: AWSManagedRulesCommonRuleSet
+          Priority: 1
+          OverrideAction:
+            None: {}
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesCommonRuleSet
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: CommonRuleSetMetric
+        - Name: AWSManagedRulesOWASPTop10
+          Priority: 2
+          OverrideAction:
+            None: {}
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesOWASPTop10RuleSet
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: OWASPTop10Metric
+        - Name: RateLimitRule
+          Priority: 3
+          Action:
+            Block: {}
+          Statement:
+            RateBasedStatement:
+              Limit: 2000
+              AggregateKeyType: IP
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: RateLimitMetric
+        - Name: Log4jProtection
+          Priority: 4
+          Action:
+            Block: {}
+          Statement:
+            OrStatement:
+              Statements:
+                - ByteMatchStatement:
+                    SearchString: "${jndi:"
+                    FieldToMatch:
+                      AllQueryArguments: {}
+                    TextTransformations:
+                      - Priority: 0
+                        Type: URL_DECODE
+                      - Priority: 1
+                        Type: LOWERCASE
+                - ByteMatchStatement:
+                    SearchString: "${jndi:"
+                    FieldToMatch:
+                      Body: {}
+                    TextTransformations:
+                      - Priority: 0
+                        Type: URL_DECODE
+                      - Priority: 1
+                        Type: LOWERCASE
+                - ByteMatchStatement:
+                    SearchString: "${jndi:"
+                    FieldToMatch:
+                      SingleHeader:
+                        Name: user-agent
+                    TextTransformations:
+                      - Priority: 0
+                        Type: URL_DECODE
+                      - Priority: 1
+                        Type: LOWERCASE
+                - ByteMatchStatement:
+                    SearchString: "jndi:"
+                    FieldToMatch:
+                      AllQueryArguments: {}
+                    TextTransformations:
+                      - Priority: 0
+                        Type: URL_DECODE
+                      - Priority: 1
+                        Type: LOWERCASE
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: Log4jProtectionMetric
+
+  # Secure API Gateway
+  HotelTracingAPI:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: HotelTracingAPI
+      Description: Secure API to invoke hotel tracing Lambda function
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+
+  ApiGatewayAuthorizer:
+    Type: AWS::ApiGateway::Authorizer
+    Properties:
+      Name: CognitoAuthorizer
+      Type: COGNITO_USER_POOLS
+      IdentitySource: method.request.header.Authorization
+      RestApiId: !Ref HotelTracingAPI
+      ProviderARNs:
+        - !GetAtt UserPool.Arn
+
+  HotelTracesResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref HotelTracingAPI
+      ParentId: !GetAtt HotelTracingAPI.RootResourceId
+      PathPart: 'hotel-traces'
+
+  RequestValidator:
+    Type: AWS::ApiGateway::RequestValidator
+    Properties:
+      RestApiId: !Ref HotelTracingAPI
+      ValidateRequestBody: true
+      ValidateRequestParameters: true
+
+  HotelTracesRequestModel:
+    Type: AWS::ApiGateway::Model
+    Properties:
+      RestApiId: !Ref HotelTracingAPI
+      ContentType: application/json
+      Schema:
+        $schema: http://json-schema.org/draft-04/schema#
+        type: object
+        properties:
+          mode:
+            type: string
+            enum: ["search", "booking", "both"]
+        required:
+          - mode
+
+  HotelTracesMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref HotelTracingAPI
+      ResourceId: !Ref HotelTracesResource
+      HttpMethod: POST
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref ApiGatewayAuthorizer
+      RequestValidatorId: !Ref RequestValidator
+      RequestModels:
+        application/json: !Ref HotelTracesRequestModel
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${HotelTraceGeneratorFunction.Arn}/invocations
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: true
+
+  # CORS Options Method
+  HotelTracesOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref HotelTracingAPI
+      ResourceId: !Ref HotelTracesResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'POST,OPTIONS'"
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: true
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+
+  # CloudWatch Log Group for API Gateway
+  ApiGatewayLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/apigateway/${HotelTracingAPI}'
+      RetentionInDays: 30
+      KmsKeyId: !Ref KMSKeyArn
+
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - HotelTracesMethod
+      - HotelTracesOptionsMethod
+    Properties:
+      RestApiId: !Ref HotelTracingAPI
+
+  ApiGatewayStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      RestApiId: !Ref HotelTracingAPI
+      DeploymentId: !Ref ApiDeployment
+      StageName: prod
+      TracingEnabled: true
+      CachingEnabled: true
+      CacheClusterEnabled: true
+      CacheClusterSize: '0.5'
+      AccessLogSetting:
+        DestinationArn: !GetAtt ApiGatewayLogGroup.Arn
+        Format: '{"requestId":"$context.requestId","ip":"$context.identity.sourceIp","caller":"$context.identity.caller","user":"$context.identity.user","requestTime":"$context.requestTime","httpMethod":"$context.httpMethod","resourcePath":"$context.resourcePath","status":"$context.status","protocol":"$context.protocol","responseLength":"$context.responseLength"}'
+      ThrottleSettings:
+        RateLimit: 1000
+        BurstLimit: 2000
+      MethodSettings:
+        - ResourcePath: "/*"
+          HttpMethod: "*"
+          LoggingLevel: INFO
+          DataTraceEnabled: false
+          MetricsEnabled: true
+          ThrottlingRateLimit: 100
+          ThrottlingBurstLimit: 200
+          CachingEnabled: true
+          CacheTtlInSeconds: 300
+
+  # Usage Plan for API Gateway
+  ApiUsagePlan:
+    Type: AWS::ApiGateway::UsagePlan
+    Properties:
+      UsagePlanName: AB3-API-Usage-Plan
+      Description: Usage plan for AB3 Hotel Booking API
+      ApiStages:
+        - ApiId: !Ref HotelTracingAPI
+          Stage: !Ref ApiGatewayStage
+      Throttle:
+        RateLimit: 1000
+        BurstLimit: 2000
+      Quota:
+        Limit: 10000
+        Period: DAY
+
+  WebACLAssociation:
+    Type: AWS::WAFv2::WebACLAssociation
+    Properties:
+      ResourceArn: !Sub arn:aws:apigateway:${AWS::Region}::/restapis/${HotelTracingAPI}/stages/${ApiGatewayStage}
+      WebACLArn: !GetAtt WebACL.Arn
+
+  # Secure IAM Roles
+  XRayExtractionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+      Policies:
+        - PolicyName: XRayAccessMinimal
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - xray:GetTraceSummaries
+                  - xray:BatchGetTraces
+                Resource: 
+                  - !Sub 'arn:aws:xray:${AWS::Region}:${AWS::AccountId}:trace/*'
+        - PolicyName: S3AccessMinimal
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:PutObjectAcl
+                Resource: !Sub 'arn:aws:s3:::${XRayDataBucketName}/xray-data/*'
+              - Effect: Allow
+                Action:
+                  - s3:GetBucketLocation
+                Resource: !Sub 'arn:aws:s3:::${XRayDataBucketName}'
+        - PolicyName: SQSAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                Resource: !GetAtt DeadLetterQueue.Arn
+
+  HotelTraceGeneratorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+      Policies:
+        - PolicyName: XRayWriteMinimal
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - xray:PutTraceSegments
+                  - xray:PutTelemetryRecords
+                Resource: 
+                  - !Sub 'arn:aws:xray:${AWS::Region}:${AWS::AccountId}:trace/*'
+        - PolicyName: SQSAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                Resource: !GetAtt DeadLetterQueue.Arn
+
+  LambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref HotelTraceGeneratorFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${HotelTracingAPI}/*/POST/hotel-traces
+
+Outputs:
+  ApiEndpoint:
+    Description: "API Gateway endpoint URL for Prod stage"
+    Value: !Sub "https://${HotelTracingAPI}.execute-api.${AWS::Region}.amazonaws.com/${ApiGatewayStage}/"
+  
+  XRayExtractionFunctionArn:
+    Description: "X-Ray Extraction Lambda Function ARN"
+    Value: !GetAtt XRayExtractionFunction.Arn
+  
+  HotelTraceGeneratorFunctionArn:
+    Description: "Hotel Trace Generator Lambda Function ARN"
+    Value: !GetAtt HotelTraceGeneratorFunction.Arn
+  
+  ApiId:
+    Description: "API Gateway ID"
+    Value: !Ref HotelTracingAPI
+    
+  UserPoolId:
+    Description: "Cognito User Pool ID"
+    Value: !Ref UserPool
+    
+  UserPoolClientId:
+    Description: "Cognito User Pool Client ID"
+    Value: !Ref UserPoolClient
