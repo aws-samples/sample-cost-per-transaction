@@ -19,7 +19,7 @@ Resources:
   AmplifyLogGroup:
     Type: AWS::Logs::LogGroup
     Properties:
-      LogGroupName: !Sub '/aws/amplify/${AmplifyApp}'
+      LogGroupName: '/aws/amplify/hotel-booking-app'
       RetentionInDays: 30
       KmsKeyId: !If [HasKMSKey, !Ref KMSKeyArn, !Ref 'AWS::NoValue']
   # Secure Amplify App
@@ -28,7 +28,6 @@ Resources:
     Properties:
       Name: hotel-booking-app
       Description: Secure Hotel Booking Application
-      Repository: https://github.com/yourusername/hotel-booking-app
       BuildSpec: |-
         version: 1
         frontend:
@@ -48,8 +47,6 @@ Resources:
           cache:
             paths:
               - node_modules/**/*
-      IAMServiceRole: !GetAtt AmplifyServiceRole.Arn
-      EnableBranchAutoBuild: true
       CustomRules:
         - Source: '/<*>'
           Target: '/index.html'
@@ -123,8 +120,7 @@ Resources:
                   - amplify:GetDeployment
                   - amplify:ListDeployments
                 Resource:
-                  - !Sub 'arn:aws:amplify:${AWS::Region}:${AWS::AccountId}:apps/${AmplifyApp}/*'
-                  - !Sub 'arn:aws:amplify:${AWS::Region}:${AWS::AccountId}:apps/${AmplifyApp}'
+                  - !Sub 'arn:aws:amplify:${AWS::Region}:${AWS::AccountId}:apps/*'
               - Effect: Allow
                 Action:
                   - codecommit:GetRepository
@@ -147,7 +143,8 @@ Resources:
                   - s3:ListBucket
                   - s3:GetBucketLocation
                 Resource:
-                  - !Sub 'arn:aws:s3:::amplify-${AmplifyApp}-*'
+                  - 'arn:aws:s3:::amplify-*'
+                  - 'arn:aws:s3:::amplify-*/*'
                   - !Sub 'arn:aws:s3:::amplify-${AmplifyApp}-*/*'
               - Effect: Allow
                 Action:

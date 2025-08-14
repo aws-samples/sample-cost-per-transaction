@@ -35,21 +35,121 @@ Resources:
       MessageRetentionPeriod: 1209600  # 14 days
       KmsMasterKeyId: !Ref KMSKeyArn
 
-  # Lambda Security Group
+  # Private Route Table for VPC Endpoints
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPCId
+      Tags:
+        - Key: Name
+          Value: AB3-Lambda-Private-RouteTable
+
+  PrivateSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet1Id
+      RouteTableId: !Ref PrivateRouteTable
+
+  PrivateSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet2Id
+      RouteTableId: !Ref PrivateRouteTable
+
+  # VPC Endpoints for AWS Services
+  S3VPCEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPCId
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.s3'
+      VpcEndpointType: Gateway
+      RouteTableIds:
+        - !Ref PrivateRouteTable
+
+  LambdaVPCEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPCId
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.lambda'
+      VpcEndpointType: Interface
+      SubnetIds:
+        - !Ref PrivateSubnet1Id
+        - !Ref PrivateSubnet2Id
+      SecurityGroupIds:
+        - !Ref VPCEndpointSecurityGroup
+
+  XRayVPCEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPCId
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.xray'
+      VpcEndpointType: Interface
+      SubnetIds:
+        - !Ref PrivateSubnet1Id
+        - !Ref PrivateSubnet2Id
+      SecurityGroupIds:
+        - !Ref VPCEndpointSecurityGroup
+
+  LogsVPCEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPCId
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.logs'
+      VpcEndpointType: Interface
+      SubnetIds:
+        - !Ref PrivateSubnet1Id
+        - !Ref PrivateSubnet2Id
+      SecurityGroupIds:
+        - !Ref VPCEndpointSecurityGroup
+
+  # Security Group for VPC Endpoints
+  VPCEndpointSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for VPC endpoints
+      VpcId: !Ref VPCId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 10.0.0.0/16
+          Description: HTTPS access from VPC resources
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 10.0.0.0/16
+          Description: HTTPS outbound within VPC for AWS service endpoints
+      Tags:
+        - Key: Name
+          Value: AB3-VPCEndpoint-SG
+
+  # Secure Lambda Security Group (no internet access)
   LambdaSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupDescription: Security group for Lambda functions with minimal access
+      GroupDescription: Security group for Lambda functions with VPC endpoint access only
       VpcId: !Ref VPCId
       SecurityGroupEgress:
         - IpProtocol: tcp
           FromPort: 443
           ToPort: 443
-          CidrIp: 0.0.0.0/0
-          Description: HTTPS outbound for AWS API calls only
+          DestinationSecurityGroupId: !Ref VPCEndpointSecurityGroup
+          Description: HTTPS access to VPC endpoints for AWS services
       Tags:
         - Key: Name
           Value: AB3-Lambda-SG
+
+  # Additional ingress rule to allow Lambda access to VPC endpoints
+  VPCEndpointIngressFromLambda:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref VPCEndpointSecurityGroup
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      SourceSecurityGroupId: !Ref LambdaSecurityGroup
+      Description: HTTPS access from Lambda functions
 
   # Cognito User Pool for API Authentication
   UserPool:
@@ -142,100 +242,6 @@ Resources:
       TracingConfig:
         Mode: Active
       KmsKeyArn: !Ref KMSKeyArn
-
-  # WAF for API Gateway
-  WebACL:
-    Type: AWS::WAFv2::WebACL
-    Properties:
-      Name: AB3HotelBookingWAF
-      Scope: REGIONAL
-      DefaultAction:
-        Allow: {}
-      Rules:
-        - Name: AWSManagedRulesCommonRuleSet
-          Priority: 1
-          OverrideAction:
-            None: {}
-          Statement:
-            ManagedRuleGroupStatement:
-              VendorName: AWS
-              Name: AWSManagedRulesCommonRuleSet
-          VisibilityConfig:
-            SampledRequestsEnabled: true
-            CloudWatchMetricsEnabled: true
-            MetricName: CommonRuleSetMetric
-        - Name: AWSManagedRulesOWASPTop10
-          Priority: 2
-          OverrideAction:
-            None: {}
-          Statement:
-            ManagedRuleGroupStatement:
-              VendorName: AWS
-              Name: AWSManagedRulesOWASPTop10RuleSet
-          VisibilityConfig:
-            SampledRequestsEnabled: true
-            CloudWatchMetricsEnabled: true
-            MetricName: OWASPTop10Metric
-        - Name: RateLimitRule
-          Priority: 3
-          Action:
-            Block: {}
-          Statement:
-            RateBasedStatement:
-              Limit: 2000
-              AggregateKeyType: IP
-          VisibilityConfig:
-            SampledRequestsEnabled: true
-            CloudWatchMetricsEnabled: true
-            MetricName: RateLimitMetric
-        - Name: Log4jProtection
-          Priority: 4
-          Action:
-            Block: {}
-          Statement:
-            OrStatement:
-              Statements:
-                - ByteMatchStatement:
-                    SearchString: "${jndi:"
-                    FieldToMatch:
-                      AllQueryArguments: {}
-                    TextTransformations:
-                      - Priority: 0
-                        Type: URL_DECODE
-                      - Priority: 1
-                        Type: LOWERCASE
-                - ByteMatchStatement:
-                    SearchString: "${jndi:"
-                    FieldToMatch:
-                      Body: {}
-                    TextTransformations:
-                      - Priority: 0
-                        Type: URL_DECODE
-                      - Priority: 1
-                        Type: LOWERCASE
-                - ByteMatchStatement:
-                    SearchString: "${jndi:"
-                    FieldToMatch:
-                      SingleHeader:
-                        Name: user-agent
-                    TextTransformations:
-                      - Priority: 0
-                        Type: URL_DECODE
-                      - Priority: 1
-                        Type: LOWERCASE
-                - ByteMatchStatement:
-                    SearchString: "jndi:"
-                    FieldToMatch:
-                      AllQueryArguments: {}
-                    TextTransformations:
-                      - Priority: 0
-                        Type: URL_DECODE
-                      - Priority: 1
-                        Type: LOWERCASE
-          VisibilityConfig:
-            SampledRequestsEnabled: true
-            CloudWatchMetricsEnabled: true
-            MetricName: Log4jProtectionMetric
 
   # Secure API Gateway
   HotelTracingAPI:
@@ -337,7 +343,6 @@ Resources:
     Properties:
       LogGroupName: !Sub '/aws/apigateway/${HotelTracingAPI}'
       RetentionInDays: 30
-      KmsKeyId: !Ref KMSKeyArn
 
   ApiDeployment:
     Type: AWS::ApiGateway::Deployment
@@ -353,26 +358,6 @@ Resources:
       RestApiId: !Ref HotelTracingAPI
       DeploymentId: !Ref ApiDeployment
       StageName: prod
-      TracingEnabled: true
-      CachingEnabled: true
-      CacheClusterEnabled: true
-      CacheClusterSize: '0.5'
-      AccessLogSetting:
-        DestinationArn: !GetAtt ApiGatewayLogGroup.Arn
-        Format: '{"requestId":"$context.requestId","ip":"$context.identity.sourceIp","caller":"$context.identity.caller","user":"$context.identity.user","requestTime":"$context.requestTime","httpMethod":"$context.httpMethod","resourcePath":"$context.resourcePath","status":"$context.status","protocol":"$context.protocol","responseLength":"$context.responseLength"}'
-      ThrottleSettings:
-        RateLimit: 1000
-        BurstLimit: 2000
-      MethodSettings:
-        - ResourcePath: "/*"
-          HttpMethod: "*"
-          LoggingLevel: INFO
-          DataTraceEnabled: false
-          MetricsEnabled: true
-          ThrottlingRateLimit: 100
-          ThrottlingBurstLimit: 200
-          CachingEnabled: true
-          CacheTtlInSeconds: 300
 
   # Usage Plan for API Gateway
   ApiUsagePlan:
@@ -390,11 +375,6 @@ Resources:
         Limit: 10000
         Period: DAY
 
-  WebACLAssociation:
-    Type: AWS::WAFv2::WebACLAssociation
-    Properties:
-      ResourceArn: !Sub arn:aws:apigateway:${AWS::Region}::/restapis/${HotelTracingAPI}/stages/${ApiGatewayStage}
-      WebACLArn: !GetAtt WebACL.Arn
 
   # Secure IAM Roles
   XRayExtractionRole:
