@@ -330,6 +330,8 @@ aws cognito-idp list-user-pools --max-results 10
 4. The processed data is stored in Redshift for reporting and analytics
 5. The Amplify App provides a frontend for users to interact with the system
 
+##For more comprehensive guide on troubleshooting follow the troubleshooting.md file
+
 ---
 
 ## Security
